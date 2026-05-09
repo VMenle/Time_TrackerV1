@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Zeit-Tracker — modern</title>
+<!-- Inter for nicer UI -->
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<script>
+/* --- IndexedDB tiny wrapper --- */
+const dbName = 'zeittracker-db';
+const storeName = 'entries';
+function openDB(){
+  return new Promise((res, rej)=>{
+    const r = indexedDB.open(dbName, 1);
+    r.onupgradeneeded = ()=> {
+      const db = r.result;
+      if(!db.objectStoreNames.contains(storeName)){
+        const os = db.createObjectStore(storeName, { keyPath: 'id' });
+        os.createIndex('start', 'start', { unique: false });
+        os.createIndex('monthKey', 'monthKey', { unique: false });
+      }
+    };
+    r.onsuccess = ()=> res(r.result);
+    r.onerror = ()=> rej(r.error);
+  });
+}
+async function putItem(item){
+  const db = await openDB();
+  return new Promise((res, rej)=>{
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).put(item);
+    tx.oncomplete = ()=> res();
+    tx.onerror = ()=> rej(tx.error);
+  });
+}
+async function getAll(){
+  const db = await openDB();
+  return new Promise((res, rej)=>{
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).getAll();
+    req.onsuccess = ()=> res(req.result.sort((a,b)=> (b.start||0)-(a.start||0)));
+    req.onerror = ()=> rej(req.error);
+  });
+}
+async function getLastOpen(){
+  const all = await getAll();
+  return all.find(e=> !e.end) || null;
+}
+async function exportCSV(){
+  const all = await getAll();
+  const rows = [['id','start','end','durationMinutes','note']];
+  all.forEach(r=>{
+    rows.push([r.id, r.start||'', r.end||'', r.durationMinutes||'', r.note||'']);
+  });
+  return rows.map(r=> r.map(c=> `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
+}
+async function importCSV(text){
+  const lines = text.split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2) return;
+  const header = lines.shift().split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(h=>h.replace(/^"|"$/g,''));
+  for(const line of lines){
+    const cols = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(c=>c.replace(/^"|"$/g,''));
+    const obj = {};
+    header.forEach((h,i)=> obj[h]=cols[i]||'');
+    const item = {
+      id: obj.id || crypto.randomUUID(),
+      start: obj.start? Number(obj.start): (obj.start? Date.parse(obj.start): null),
+      end: obj.end? Number(obj.end): (obj.end? Date.parse(obj.end): null),
+      durationMinutes: obj.durationMinutes? Number(obj.durationMinutes): null,
+      note: obj.note||''
+    };
+    if(item.start && !item.durationMinutes && item.end) item.durationMinutes = Math.round((item.end - item.start)/60000);
+    item.monthKey = item.start ? (new Date(item.start)).toISOString().slice(0,7) : '';
+    await putItem(item);
+  }
+}
+
+/* --- Utilities --- */
+function nowMs(){ return Date.now(); }
+function fmtHMFromMinutes(totalMin){
+  if(!isFinite(totalMin)) totalMin = 0;
+  const sign = totalMin<0 ? '-' : '';
+  totalMin = Math.abs(Math.round(totalMin));
+  const h = Math.floor(totalMin/60);
+  const m = totalMin%60;
+  return sign + String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0');
+}
+function dateISO(ms){
+  if(!ms) return '';
+  const d = new Date(Number(ms));
+  return d.toISOString().slice(0,19).replace('T',' ');
+}
+function monthKeyFromMs(ms){ if(!ms) return ''; return new Date(Number(ms)).toISOString().slice(0,7); }
+
+/* --- App logic --- */
+async function startEntry(){
+  const open = await getLastOpen();
+  if(open) return;
+  const item = { id: crypto.randomUUID(), start: nowMs(), end: null, durationMinutes: null, note: '', monthKey: monthKeyFromMs(nowMs())};
+  await putItem(item);
+  renderAll();
+}
+async function stopEntry(){
+  const open = await getLastOpen();
+  if(!open) return;
+  open.end = nowMs();
+  open.durationMinutes = Math.round((open.end - open.start)/60000);
+  open.monthKey = monthKeyFromMs(open.start);
+  await putItem(open);
+  renderAll();
+}
+async function saveEdited(entry){
+  if(entry.start && typeof entry.start === 'string') entry.start = Date.parse(entry.start.replace(' ','T')) || Number(entry.start);
+  if(entry.end && typeof entry.end === 'string') entry.end = Date.parse(entry.end.replace(' ','T')) || Number(entry.end);
+  if(entry.start && entry.end) entry.durationMinutes = Math.round((entry.end - entry.start)/60000);
+  entry.monthKey = entry.start ? monthKeyFromMs(entry.start) : '';
+  await putItem(entry);
+  renderAll();
+}
+
+/* --- UI rendering & state --- */
+let appState = { view: 'home' };
+
+async function renderAll(){
+  const all = await getAll();
+  const open = all.find(e=> !e.end) || null;
+
+  // header: name + month sum
+  const name = localStorage.getItem('zt_name') || '';
+  document.getElementById('userGreeting').textContent = name ? `Hi, ${name}` : 'Hi';
+  const monthKey = (new Date()).toISOString().slice(0,7);
+  const sumMin = all.filter(e=> e.monthKey === monthKey && e.durationMinutes).reduce((s,e)=> s + (e.durationMinutes||0), 0);
+  document.getElementById('monthLabel').textContent = 'Stunden diesen Monat';
+  document.getElementById('monthSum').textContent = fmtHMFromMinutes(sumMin);
+
+  // action button
+  const btn = document.getElementById('btnAction');
+  btn.textContent = open ? 'Stop' : 'Start';
+  btn.dataset.state = open ? 'stop' : 'start';
+  btn.className = open ? 'big-btn stop' : 'big-btn start';
+  document.getElementById('currentInfo').textContent = open ? `Läuft seit ${dateISO(open.start)}` : 'Keine laufende Zeit';
+
+  // fill overview only when in overview view (and also used for summary)
+  renderOverview(all);
+  // render settings name display
+  document.getElementById('nameInput').value = localStorage.getItem('zt_name') || '';
+}
+
+/* --- Overview rendering --- */
+function renderOverview(all){
+  // Overview: months grouped with small sum; search + last 10 editable; list of entries per month
+  const overview = document.getElementById('overviewContent');
+  if(!overview) return;
+  // search value
+  const searchVal = document.getElementById('overviewSearch').value.trim().toLowerCase();
+  // group
+  const grouped = {};
+  all.forEach(item=>{
+    const key = item.monthKey || 'unbekannt';
+    if(searchVal){
+      const s = ((item.note||'') + ' ' + (item.id||'') + ' ' + (item.start? dateISO(item.start): '')).toLowerCase();
+      if(!s.includes(searchVal)) return;
+    }
+    if(!grouped[key]) grouped[key]=[];
+    grouped[key].push(item);
+  });
+  const months = Object.keys(grouped).sort((a,b)=> b.localeCompare(a));
+  // month list HTML
+  const monthHtml = months.map(m=>{
+    const rows = grouped[m].sort((a,b)=> (b.start||0)-(a.start||0)).map(r=>{
+      const dur = r.durationMinutes != null ? fmtHMFromMinutes(r.durationMinutes) : (r.start ? '—' : '');
+      return `<tr data-id="${r.id}">
+        <td class="td-date">${r.start? dateISO(r.start): ''}</td>
+        <td class="td-date">${r.end? dateISO(r.end): ''}</td>
+        <td class="td-dur">${dur}</td>
+        <td class="td-note">${escapeHtml(r.note||'')}</td>
+      </tr>`;
+    }).join('');
+    const monthSum = grouped[m].filter(x=>x.durationMinutes).reduce((s,x)=> s+(x.durationMinutes||0),0);
+    return `<div class="month-card">
+      <div class="month-header">
+        <div class="month-title">${m}</div>
+        <div class="month-sum-small">${fmtHMFromMinutes(monthSum)}</div>
+      </div>
+      <table class="entries-table"><thead><tr><th>Start</th><th>Ende</th><th>Dauer</th><th>Notiz</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>`;
+  }).join('') || '<div class="muted">Keine Einträge</div>';
+
+  // last 10 editable
+  const last10 = all.slice(0,10).map(e=> ({...e}));
+  const editHtml = last10.length ? `<table class="edit-table"><thead><tr><th>Start</th><th>Ende</th><th>Notiz</th><th></th></tr></thead><tbody>${last10.map(r=> `
+      <tr data-id="${r.id}">
+        <td><input class="edit-input start" data-id="${r.id}" value="${r.start? new Date(r.start).toISOString().slice(0,19).replace('T',' '):''}" /></td>
+        <td><input class="edit-input end" data-id="${r.id}" value="${r.end? new Date(r.end).toISOString().slice(0,19).replace('T',' '):''}" /></td>
+        <td><input class="edit-input note" data-id="${r.id}" value="${escapeHtmlAttr(r.note||'')}" /></td>
+        <td><button class="btn small save-edit" data-id="${r.id}">Speichern</button></td>
+      </tr>
+    `).join('')}</tbody></table>` : '<div class="muted">Keine Einträge</div>';
+
+  overview.innerHTML = `
+    <div class="section">
+      <h4>Letzte 10 (korrigieren)</h4>
+      ${editHtml}
+    </div>
+    <div class="section" style="margin-top:14px;">
+      <h4>Monats-Übersicht</h4>
+      ${monthHtml}
+    </div>
+  `;
+
+  // attach save handlers
+  overview.querySelectorAll('.save-edit').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const id = btn.dataset.id;
+      const startVal = overview.querySelector(`input.edit-input.start[data-id="${id}"]`).value;
+      const endVal = overview.querySelector(`input.edit-input.end[data-id="${id}"]`).value;
+      const noteVal = overview.querySelector(`input.edit-input.note[data-id="${id}"]`).value;
+      const entry = { id, start: startVal? Date.parse(startVal.replace(' ','T')): null, end: endVal? Date.parse(endVal.replace(' ','T')): null, note: noteVal };
+      await saveEdited(entry);
+    });
+  });
+}
+
+/* --- helpers --- */
+function escapeHtml(s){ if(!s) return ''; return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escapeHtmlAttr(s){ return (s||'').replace(/"/g,'&quot;'); }
+
+/* --- init & events --- */
+document.addEventListener('DOMContentLoaded', async ()=>{
+  // nav buttons
+  document.querySelectorAll('.nav-btn').forEach(b=>{
+    b.addEventListener('click', ()=>{
+      const view = b.dataset.view;
+      appState.view = view;
+      document.querySelectorAll('.view').forEach(v=> v.classList.add('hidden'));
+      document.getElementById(view).classList.remove('hidden');
+      document.querySelectorAll('.nav-btn').forEach(x=> x.classList.remove('active'));
+      b.classList.add('active');
+      // renderAll for freshness
+      renderAll();
+    });
+  });
+
+  // main action
+  document.getElementById('btnAction').addEventListener('click', async ()=>{
+    const state = document.getElementById('btnAction').dataset.state;
+    if(state === 'start') await startEntry(); else await stopEntry();
+  });
+
+  // overview search and filter
+  document.getElementById('overviewSearch').addEventListener('input', renderAll);
+
+  // settings: save name and import/export
+  document.getElementById('saveSettings').addEventListener('click', ()=>{
+    const name = document.getElementById('nameInput').value.trim();
+    localStorage.setItem('zt_name', name);
+    renderAll();
+    alert('Name gespeichert');
+  });
+
+  document.getElementById('btnExportSettings').addEventListener('click', async ()=>{
+    const csv = await exportCSV();
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'zeittracker_export.csv'; a.click();
+    URL.revokeObjectURL(url);
+  });
+  document.getElementById('btnImportSettings').addEventListener('click', ()=> document.getElementById('fileImport').click());
+  document.getElementById('fileImport').addEventListener('change', async (ev)=>{
+    const f = ev.target.files[0];
+    if(!f) return;
+    const text = await f.text();
+    await importCSV(text);
+    renderAll();
+    alert('Import abgeschlossen');
+  });
+
+  // initial view
+  document.getElementById('home').classList.remove('hidden');
+  document.querySelector('.nav-btn[data-view="home"]').classList.add('active');
+  await renderAll();
+});
+</script>
+
+<style>
+:root{
+  --bg:#0f172a; --accent:#06b6d4; --muted:#64748b;
+  --card:#ffffff;
+}
+*{ box-sizing:border-box; font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial; }
+body{ margin:0; background:#f8fafc; color:var(--bg); padding-bottom:90px; }
+.app{ max-width:920px; margin:18px auto; padding:16px; }
+
+/* header */
+.header {
+  display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px;
+}
+.greeting { text-align:left; }
+.greeting .hi { font-weight:700; font-size:20px; }
+.greeting .sub { color:var(--muted); font-size:13px; margin-top:4px; }
+
+/* centered month sum */
+.month-card { text-align:center; margin:6px 0 12px; }
+.month-card .label { color:var(--muted); font-size:13px; }
+.month-card .sum { font-weight:700; font-size:28px; margin-top:6px; background:linear-gradient(90deg,#f0f9ff,#f0fff4); display:inline-block; padding:10px 16px; border-radius:12px; box-shadow:0 8px 28px rgba(2,6,23,0.06); }
+
+/* big action button */
+.big-btn{
+  border:0; padding:18px 28px; border-radius:14px; font-size:18px; color:white; cursor:pointer; box-shadow: 0 10px 30px rgba(2,6,23,0.08);
+}
+.big-btn.start{ background: linear-gradient(90deg,#06b6d4,#0891b2); }
+.big-btn.stop{ background: linear-gradient(90deg,#ef4444,#dc2626); }
+
+/* cards */
+.card{ background:var(--card); border-radius:12px; padding:14px; box-shadow:0 8px 30px rgba(2,6,23,0.04); margin-bottom:12px; }
+
+/* nav bottom */
+nav.bottom-nav{ position:fixed; left:50%; transform:translateX(-50%); bottom:14px; width:92%; max-width:920px; display:flex; gap:10px; padding:6px; }
+.nav-btn{ flex:1; padding:12px 14px; border-radius:12px; background:linear-gradient(180deg,#ffffff,#f8fafc); border:1px solid #eef2ff; cursor:pointer; font-weight:600; color:var(--muted); box-shadow:0 8px 20px rgba(2,6,23,0.04); }
+.nav-btn.active{ outline:2px solid rgba(6,182,212,0.12); color:var(--bg); }
+
+/* overview */
+.section h4{ margin:0 0 8px 0; font-size:15px; }
+.edit-table input{ padding:8px; border-radius:8px; border:1px solid #eef2ff; width:100%; }
+.btn.small{ padding:8px 10px; border-radius:8px; border:0; background:var(--accent); color:white; cursor:pointer; }
+.month-card{ margin-bottom:12px; }
+.month-header{ display:flex; justify-content:space-between; align-items:center; padding:10px; border-radius:10px; background:linear-gradient(90deg,#ffffff,#fbfdff); border:1px solid #f1f5f9; }
+.month-title{ font-weight:600; }
+.month-sum-small{ color:var(--muted); font-size:13px; }
+
+/* tables */
+.entries-table{ width:100%; border-collapse:collapse; margin-top:8px; }
+.entries-table th{ text-align:left; font-size:13px; color:var(--muted); padding:8px 6px; border-bottom:1px solid #f1f5f9; }
+.entries-table td{ padding:8px 6px; font-size:13px; border-bottom:1px solid #f8fafc; }
+.td-date{ width:200px; color:#0f172a; font-size:13px; }
+.td-dur{ width:80px; text-align:left; font-weight:600; }
+
+/* small helpers */
+.muted{ color:var(--muted); font-size:13px; padding:10px; }
+
+/* views visibility */
+.view.hidden{ display:none; }
+
+/* responsive */
+@media (max-width:720px){
+  .td-date{ width:120px; font-size:12px; }
+  .month-card .sum{ font-size:20px; }
+}
+</style>
+</head>
+<body>
+  <div class="app">
+    <div class="header">
+      <div class="greeting">
+        <div id="userGreeting" class="hi">Hi</div>
+        <div class="sub">Zeit einfach lokal tracken</div>
+      </div>
+      <div class="month-card">
+        <div class="label" id="monthLabel">Stunden diesen Monat</div>
+        <div id="monthSum" class="sum">00:00</div>
+      </div>
+    </div>
+
+    <!-- HOME view -->
+    <div id="home" class="view card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <div>
+          <div id="currentInfo" style="color:var(--muted);">Keine laufende Zeit</div>
+        </div>
+        <div>
+          <button id="btnAction" class="big-btn start" data-state="start">Start</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- OVerview -->
+    <div id="overview" class="view hidden card">
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <input id="overviewSearch" placeholder="Suche (Notiz, Datum, ID)" style="flex:1;padding:10px;border-radius:10px;border:1px solid #eef2ff" />
+      </div>
+      <div id="overviewContent"></div>
+    </div>
+
+    <!-- Settings -->
+    <div id="settings" class="view hidden card">
+      <h4 style="margin-top:0">Settings</h4>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;">
+        <input id="nameInput" placeholder="Name (optional)" style="flex:1;padding:10px;border-radius:10px;border:1px solid #eef2ff" />
+        <button id="saveSettings" class="btn small">Speichern</button>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button id="btnExportSettings" class="btn small" style="background:#0ea5a4">Export CSV</button>
+        <button id="btnImportSettings" class="btn small" style="background:#f3f4f6;color:var(--bg);border:1px solid #eef2ff">Import CSV</button>
+        <input id="fileImport" type="file" accept=".csv" style="display:none" />
+      </div>
+    </div>
+
+  </div>
+
+  <nav class="bottom-nav">
+    <button class="nav-btn" data-view="home">Home</button>
+    <button class="nav-btn" data-view="overview">Übersicht</button>
+    <button class="nav-btn" data-view="settings">Settings</button>
+  </nav>
+</body>
+</html>
