@@ -1,7 +1,7 @@
 {
 "name": "Zeit Tracker",
 "short_name": "Zeit",
-"start_url": "/Zeit_Tracker.html",
+"start_url": "/index.html",
 "display": "standalone",
 "background_color": "#f8fafc",
 "theme_color": "#06b6d4",
